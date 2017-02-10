@@ -9,24 +9,31 @@
 
 ## Introduction
 
-This proposal fixes several shortcomings with the current Comparable system by introducing a new ternary-valued `compared(to: Self) -> SortOrder` method. It also makes FloatingPoint comparison context sensitive, so that its Comparable conformance provides a proper total ordering. These are technically two distinct proposals that can be done independently, but are included together for historical reasons.
+This proposal is a grab-bag of several independent changes that we believe should be made to the existing comparison system by: 
+
+* Making FloatingPoint comparison context sensitive, so that its Comparable conformance provides a proper total ordering.
+* Introducing a new ternary-valued `compared(to: Self) -> SortOrder` method.
+* Adding a generalized comparison to String for tuning sensitivities and locale.
+* Removing unnecessary customization points from Comparison.
+
+ 
 
 
 
 
 ## Motivation
 
-The standard comparison operators have an intuitive meaning to programmers. Swift encourages encoding that in an implementation of `Comparable` that respects the rules of a [total order](https://en.wikipedia.org/wiki/Total_order). The standard library takes advantage of these rules to provide consistent implementations for sorting and searching generic collections of `Comparable` types.  
+Because this is a grab-bag, the motivation comes from several independent points:
 
-Not all types behave so well in this framework, unfortunately. There are cases where the semantics of a total order cannot apply and still maintain the traditional definition of “comparison” over these types.  Take, for example, sorting an array of `Float` s.  Today, `Float`'s instance of `Comparable` follows IEEE-754 and returns `false` for all comparisons of `NaN`. In order to sort this array, `NaN` s are considered outside the domain of `<`, and the order of a sorted array containing them is unspecified. Similarly, a Dictionary keyed off floats can leak entries and memory.
+1: The standard comparison operators have an intuitive meaning to programmers. Swift encourages encoding that in an implementation of `Comparable` that respects the rules of a [total order](https://en.wikipedia.org/wiki/Total_order). The standard library takes advantage of these rules to provide consistent implementations for sorting and searching generic collections of `Comparable` types.  
 
-In addition, generic algorithms in the Swift Standard Library that make use of the current `Comparable` protocol may have to make twice as many comparisons to request the ordering of values with respect to each other than they should. Having a central operation to return information about the ordering of values once should provide a speedup for these operations.
+Not all types behave so well in this framework, unfortunately. There are cases where the semantics of a total order cannot apply while still maintaining the traditional definition of “comparison” for these types. Take, for example, sorting an array of `Float`s. Today, `Float`'s instance of `Comparable` follows IEEE-754 and returns `false` for all comparisons of `NaN`. In order to sort this array, `NaN` s are considered outside the domain of `<`, and the order of a sorted array containing them is unspecified. Similarly, a Dictionary keyed off floats can leak entries and memory.
 
-Comparable is also over-engineered in the customization points it provides: to our knowledge, there's no good reason to ever override `>=`, `>`, or `<=`. Each customization point bloats vtables and mandates additional dynamic dispatch.
+2: Generic algorithms in the Swift Standard Library that make use of the current `Comparable` protocol may have to make extra comparisons to determine the ordering of values when `<`, `==`, and `>` should have different behaviours. Having a central operation to return complete ordering information should provide a speedup for these operations.
 
-Finally, comparison operators don't "generalize" well. There's no clean way to add a third or fourth argument to `<` to ask for non-default semantics. An example where this would be desirable would be specifying the locale or case-sensitivity when comparing Strings.
+3: The existing comparison operators don't "generalize" well. There's no clean way to add a third or fourth argument to `<` to ask for non-default semantics. An example where this would be desirable would be specifying the locale or case-sensitivity when comparing Strings.
 
-In the interest of cleaning up the semantics of `Comparable` types of all shapes and sizes and their uses in the Swift Standard Library, this proposal rearranges the requirements of the `Comparable` and `Equatable` protocols in a backwards-compatible way.
+4: Comparable is over-engineered in the customization points it provides: to our knowledge, there's no good reason to ever override `>=`, `>`, or `<=`. Each customization point bloats vtables and mandates additional dynamic dispatch.
 
 
 
@@ -37,9 +44,13 @@ In the interest of cleaning up the semantics of `Comparable` types of all shapes
 
 
 
-### Comparable
+### ComparisonResult
 
-A new `enum SortOrder { case before, same, after }` will be introduced.
+Foundation's ComparisonResult type will be mapped into Swift as `@objc enum SortOrder: Int { case before = -1, same = 0, after = 1 }`. 
+
+
+
+### Comparable
 
 Comparable will be changed to have a new ternary comparison method: `compared(to: Self) -> SortOrder`. `x.compared(to: y)` specifies where to place x relative to y. So if it yields `.before`, then x comes before y. This will be considered the new "main" dispatch point of Comparable that implementors should provide.
 
@@ -79,7 +90,7 @@ This results in code that is explicitly designed to work with FloatingPoint type
 
 To clarify: Dictionary and sort won't somehow detect that they're being used with FloatingPoint types and use level 1 comparisons. Instead they will unconditional use level 2 behaviour. For example:
 
-```
+```swift
 let nan = 0.0/0.0
 
 func printEqual<T: Equatable>(_ x: T, _ y: T) {
@@ -97,7 +108,7 @@ printEqualFloats(nan, nan) // false, (generic FloatingPoint)
 
 If one wishes to have a method that works with all Equatable/Comparable types, but uses level 1 semantics for FloatingPoint types, then they can simply provide two identical implementations that differ only in the bounds:
 
-```
+```swift
 let nan = 0.0/0.0
 
 func printEqual<T: Equatable>(_ x: T, _ y: T) {
@@ -112,19 +123,41 @@ printEqual(0, 0)           // true (integers use `<T: Equatable>` overload)
 printEqual(nan, nan)       // false (floats use `<T: FloatingPoint>` overload)
 ```
 
+As a result of this change, hashing of floats must be updated to make all NaNs hash equally. -0 and +0 will also no longer be expected to hash equally. (Although they might as an implementation detail -- equal values must hash the same, unequal values *may* hash the same.)
 
 
 
 
-### Standard Library
 
-Functions that take an ordering predicate `(Self, Self) -> Bool` will now also have an overload for `(Self, Self) -> Ordering`. 
+### String
+
+String will get this small piece of the [String Manifesto](https://github.com/apple/swift/blob/master/docs/StringManifesto.md) implemented:
+
+A new enum will be introduced to represent sensitivity options for Strings: `enum StringSensitivity { case sensitive, insensitive }`.
+
+String will add a new overload of the `compared` method:
+
+```swift
+func compared(
+  to other: String,
+  case caseSensitivity: StringSensitivity = .sensitive,
+  diacritic diacriticSensitivity: StringSensitivity = .sensitive,
+  width widthSensitivity: StringSensitivity = .sensitive,
+  in locale: Locale? = nil
+) -> SortOrder
+```
+
+Note: for this API there's no need to have `compared` take optional Sensitivities, because the default should in fact always be `.sensitive`. Searching is the only case where optional sensitivities will matter.
+
+
+
+
+### Misc Standard Library
 
 Types that conform to Comparable should be audited for places where implementing or using Comparable would be a win. This update can be done incrementally, as the only potential impact should be performance. As an example, a default implementation of `compared(to:)` for Array will likely be suboptimal, performing two linear scans to determine the result in the worst-case. (See the default implementation provided in the detailed design.)
 
 Some free functions will have `<T: FloatingPoint>` overloads to better align with IEEE-754 semantics. This will be addressed in a follow-up proposal. (example: `min` and `max`)
 
-SortOrder should be bridged to Foundation's ComparisonResult type.
 
 
 
@@ -132,9 +165,11 @@ SortOrder should be bridged to Foundation's ComparisonResult type.
 
 The protocols will be changed as follows:
 
-```
-public enum SortOrder: Equatable {
-    case before, same, after
+```swift
+@objc public enum SortOrder: Int, Equatable {
+  case before = -1
+  case same = 0
+  case after = 1
 }
 
 public protocol Comparable: Equatable {
@@ -261,13 +296,14 @@ Note that this design mandates several changes to the compiler:
 
 
 
+
 ## Source compatibility
+
+Users of ComparisonResult will be able to use it as normal in Swift 3 mode with a type alias and static vars emulating its old case names. In Swift 4 mode it and its variants will be marked as deprecated. Compiler diagnostics may need to be improved to minimize spurious exhaustiveness warnings.
 
 Existing implementors of Comparable will be unaffected, though they should consider implementing the new `compared` method as the default implementation may be suboptimal.
 
 Consumers of Comparable will be unaffected, though they should consider calling the `compared` method if it offers a performance advantage. 
-
-APIs which provide a `(Self, Self) -> Bool` overload for comparison should consider adding a `(Self, Self) -> SortOrder` overload.
 
 Existing implementors of FloatingPoint should be unaffected -- they will automatically get the new behaviour as long as they aren't manually implementing the requirements of Equatable/Comparable.
 
@@ -299,16 +335,17 @@ Early versions of this proposal aimed to instead provide a `<=>` operator in pla
 
 Spaceship as an operator has a two concrete benefits over `compared` today:
 
-* It can be passed as a higher-order function
+* It can be passed to a higher-order function
 * Tuples can implement it
 
 In our opinion, these aren't serious problems, especially in the long term. 
 
 Passing `<=>` as a higher order function basically allows types that aren't Comparable, but do provide `<=>`, to be very ergonomically handled by algorithms which take an optional ordering function. Types which provide the comparable operators but don't conform to Comparable are only pervasive due to the absence of conditional conformance. We shouldn't be designing our APIs around the assumption that conditional conformance doesn't exist. 
 
-When conditional conformance is implemented, the only should-be-comparable-but-aren't types that remain are tuples, which we should potentially have the compiler synthesize conformances for.
+When conditional conformance is implemented, the only should-be-comparable-but-aren't types that will remain are tuples, which we should potentially have the compiler synthesize conformances for.
 
-Similarly, it should be one day possibly to extend tuples, although this is a more "far future" matter. Until then, the `(T, T) -> Bool` predicate will always also be available, and `<` can be used there with the only downside being a potential performance hit.
+Similarly, it should one day be possible to extend tuples, although this is a more "far future" matter. Until then, the `(T, T) -> Bool` predicate will always also be available, and `<` can be used there with the only downside being a potential performance hit.
+
 
 
 
@@ -332,6 +369,7 @@ Although floats are more subtle than integers, having places where integers work
 
 
 
+
 ### PartialComparable
 
 PartialComparable would essentially just be Comparable without any stated ordering requirements, that Comparable extends to provide ordering requirements. This would be a protocol that standard IEEE comparison could satisfy, but in the absence of total ordering requirements, PartialComparable is effectively useless. Either everyone would consume PartialComparable (to accept floats) or Comparable (to have reasonable behaviour).
@@ -345,8 +383,8 @@ The Rust community adopted this strategy to little benefit. The Rust libs team h
 
 A few different names for SortOrder and its variants were passed around:
 
-* `enum Ordering { case less, equal, greater }` ([as used by Rust](https://doc.rust-lang.org/std/cmp/enum.Ordering.html))
 * `enum ComparisonResult { case ascending, same, descending }` ([as used by Foundation](https://developer.apple.com/reference/foundation/comparisonresult))
+* `enum Ordering { case less, equal, greater }` ([as used by Rust](https://doc.rust-lang.org/std/cmp/enum.Ordering.html))
 * `enum SortOrder { case inOrder, same, outOfOrder }`
 
 The choice of case names is non-trivial because the enum shows up in different contexts where different names makes more sense. Effectively, one needs to keep in mind that the "default" sort order is ascending to map between the concept of "before" and "less". 
@@ -358,11 +396,23 @@ Once we had decided that the enum should focus on the sorting case, it made sens
 
 
 
+### Bridge ComparisonResult
+
+Instead of mapping it, ComparisonResult could be bridged. The primary benefit of this would be to:
+
+* Enable us to insert clamping code for invalid values (ComparisonResult can be e.g. -7, and this will lead to Undefined Behaviour in Swift code)
+* Make it a distinct type for Swift 3 mode to better understand
+
+Ultimately this solution seemed to be more complicated, and the clamping behaviour wasn't expected to come up enough to matter. If it does prove to matter, we expect a better solution would be to teach the compiler that SortOrder's before and after cases are actually *ranges* -- all negative and all positive values. This may actually improve codegen.
+
+
+
+
 ### Comparison Mode Decorators
 
 In response to the desire to generalize comparison, it has been suggested that types should instead provide decorators that provide different comparison modes. For instance:
 
-```
+```swift
 string1.withLocale(locale) < string2.withLocale(locale)
 ```
 
@@ -371,7 +421,6 @@ The benefits are as follows:
 * Updating most code, which only uses `<` or `==`, to use a non-default comparison will be more clean -- just tack on `withLocale` instead of rewriting it to use `compared`.
 
 * This can potentially be used to pass down the new ordering behaviour to container types -- `sortedTree[string.withLocale(locale)] = y`
-
 
 
 The concerns for this are as follows:
@@ -390,9 +439,37 @@ Ultimately we decided against this approach because it seemed more complex to ge
 
 
 
+
+### Add Overloads for `(T, T) -> SortOrder`
+
+It would be slightly more ergonomic to work with SortOrder if existing methods that took an ordering predicate also had an overload for `(T, T) -> SortOrder`. As it stands, a case-insensitive sort must be written as follows:
+
+```swift
+myStrings.sort { $0.compared(to: $1, case: .insensitive) == .before }
+```
+
+With the overload, one could write:
+
+```swift
+myStrings.sort { $0.compared(to: $1, case: .insensitive) }
+```
+
+we decided against providing these overloads because: 
+
+* The existing algorithms in the standard library can't benefit from them (only binary comparisons).
+* They bloat up the standard library (and any library which intends to match our API guidelines).
+* They potentially introduce confusion over "which" comparison overload to use.
+
+And because we can change our mind later backwards-compatibly.
+
+
+
+
+
 ## Future Work
 
-More things can be done here, but those should hopefully be backwards compatible to introduce. Two paths that are worth exploring:
+This section covers some topics which were briefly considered, but were identified as reasonable and possible to defer to future releases. Specifically they should be backwards compatible to introduce even after ABI stability. Two paths that are worth exploring:
+
 
 
 
@@ -404,23 +481,25 @@ We can avoid answering this question because Dictionary is expected to keep a re
 
 
 
+
 ### SortOrder Conveniences
 
 There are a few conveniences we could consider providing to make SortOrder more ergonomic to manipulate. Such as:
 
-```
+```swift
 // A way to combine orderings
 func SortOrder.breakingTiesWith(_ order: () -> SortOrder) -> SortOrder
 
 array.sort {
   $0.x.compared(to: $0.y)
   .breakingTiesWith { $0.y.compared(to: $1.y) }
+  == .before 
 }
 ```
 
 and
 
-```
+```swift
 var inverted: SortOrder
 
 // A perhaps more "clear" way to express reversing order than `y.compared(to: x)`
@@ -428,3 +507,7 @@ x.compared(to: y).inverted
 ```
 
 But these can all be added later once everyone has had a chance to use them.
+
+
+
+
